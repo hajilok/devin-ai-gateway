@@ -54,9 +54,15 @@ export function chatCompletionsHandler(deps: ChatCompletionsDeps): RequestHandle
         throw badRequest(msg, "invalid_messages");
       }
 
+      // Keep info logs free of user content; the truncated preview only goes
+      // to debug to avoid leaking prompts/tasks into production log streams.
       logger.info(
-        { model, prompt_preview: prompt.slice(0, 200), prompt_length: prompt.length },
+        { model, prompt_length: prompt.length },
         "creating Devin session"
+      );
+      logger.debug(
+        { model, prompt_preview: prompt.slice(0, 200), prompt_length: prompt.length },
+        "Devin session prompt preview"
       );
 
       const created = await client.createSession(prompt);

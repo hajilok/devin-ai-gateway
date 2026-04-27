@@ -92,7 +92,32 @@ export function createApp(opts: CreateAppOptions): Express {
       res.status(err.status).json(err.toBody());
       return;
     }
-    const message = err instanceof Error ? err.message : "Internal server error";
+
+    // Errors thrown by upstream middleware (most importantly `express.json()`'s
+    // body parser) carry a `status`/`statusCode`. Treat any 4xx as a client
+    // problem so we stay OpenAI-compatible instead of masking it as a 500.
+    const errObj = err as { status?: number; statusCode?: number; type?: string; message?: string } | null;
+    const status = Number(errObj?.status ?? errObj?.statusCode ?? 0);
+    const message =
+      err instanceof Error ? err.message : typeof errObj?.message === "string" ? errObj.message : "Internal server error";
+
+    if (status >= 400 && status < 500) {
+      req.log?.warn({ err, status }, "request rejected by middleware");
+      const code =
+        // body-parser uses `type: "entity.parse.failed"` for malformed JSON
+        typeof errObj?.type === "string" && errObj.type === "entity.parse.failed"
+          ? "invalid_json"
+          : undefined;
+      res.status(status).json({
+        error: {
+          message,
+          type: "invalid_request_error",
+          ...(code ? { code } : {}),
+        },
+      });
+      return;
+    }
+
     req.log?.error({ err }, "unhandled error");
     res.status(500).json({
       error: { message, type: "internal_error" },

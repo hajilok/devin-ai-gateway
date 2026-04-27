@@ -10,8 +10,8 @@ export interface AppConfig {
   logLevel: string;
 }
 
-function readNumber(name: string, fallback: number): number {
-  const raw = process.env[name];
+function readNumber(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
   if (raw === undefined || raw === "") return fallback;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) {
@@ -30,11 +30,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const devinApiBase = (env.DEVIN_API_BASE?.trim() || "https://api.devin.ai").replace(/\/+$/, "");
 
   return {
-    port: readNumber("PORT", 8787),
+    port: readNumber(env, "PORT", 8787),
     devinApiKey,
     devinApiBase,
-    devinPollIntervalMs: readNumber("DEVIN_POLL_INTERVAL_MS", 3000),
-    devinPollTimeoutMs: readNumber("DEVIN_POLL_TIMEOUT_MS", 600_000),
+    devinPollIntervalMs: readNumber(env, "DEVIN_POLL_INTERVAL_MS", 3000),
+    devinPollTimeoutMs: readNumber(env, "DEVIN_POLL_TIMEOUT_MS", 600_000),
     gatewayApiKey: env.GATEWAY_API_KEY?.trim() ?? "",
     logLevel: env.LOG_LEVEL?.trim() || "info",
   };

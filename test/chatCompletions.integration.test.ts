@@ -195,6 +195,32 @@ describe("POST /v1/chat/completions", () => {
     expect(res.status).toBe(400);
     expect(res.body.error?.code).toBe("stream_not_supported");
   });
+
+  it("returns 400 invalid_request_error when the request body is malformed JSON", async () => {
+    const behavior: MockBehavior = {
+      polls: 0,
+      calls: [],
+      finishAfter: 1,
+      sessionId: "x",
+      finalMessage: "x",
+    };
+    const app = createApp({
+      config: baseConfig(),
+      fetchImpl: makeFetchMock(behavior),
+      logger: silentLogger,
+    });
+
+    const res = await request(app)
+      .post("/v1/chat/completions")
+      .set("content-type", "application/json")
+      .send("{bad json");
+
+    expect(res.status).toBe(400);
+    expect(res.body.error?.type).toBe("invalid_request_error");
+    expect(res.body.error?.code).toBe("invalid_json");
+    // The upstream Devin client must never have been called for a body parse error.
+    expect(behavior.calls).toHaveLength(0);
+  });
 });
 
 describe("misc routes", () => {
