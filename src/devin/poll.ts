@@ -11,6 +11,12 @@ export interface PollOptions {
   now?: () => number;
   /** Optional cancel signal. */
   signal?: AbortSignal;
+  /**
+   * Invoked after every successful `getSession` call (including the terminal
+   * one). Streaming consumers use this to emit incremental SSE chunks as new
+   * Devin agent messages arrive.
+   */
+  onSnapshot?: (session: DevinSession) => void | Promise<void>;
 }
 
 export interface PollResult {
@@ -46,6 +52,7 @@ export async function pollUntilDone(
     }
 
     last = await client.getSession(sessionId);
+    if (opts.onSnapshot) await opts.onSnapshot(last);
     const status = last.status_enum ?? last.status;
     if (isTerminalStatus(status)) {
       return { session: last, timedOut: false };

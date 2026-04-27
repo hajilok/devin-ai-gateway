@@ -25,7 +25,16 @@ interface MockBehavior {
   finalMessage: string;
 }
 
-function makeFetchMock(behavior: MockBehavior): typeof fetch {
+interface MockOptions {
+  /**
+   * If provided, each progressive message becomes a `devin_message` that is
+   * surfaced one poll earlier than the next one. The `finalMessage` is then
+   * appended on the terminal poll.
+   */
+  progressiveMessages?: string[];
+}
+
+function makeFetchMock(behavior: MockBehavior, options: MockOptions = {}): typeof fetch {
   return (async (input: any, init?: any) => {
     const url = typeof input === "string" ? input : input.url;
     const method = (init?.method ?? "GET").toUpperCase();
@@ -47,23 +56,48 @@ function makeFetchMock(behavior: MockBehavior): typeof fetch {
     if (method === "GET" && url.includes(`/v1/sessions/${behavior.sessionId}`)) {
       behavior.polls += 1;
       const isLast = behavior.polls >= behavior.finishAfter;
+      const progressive = options.progressiveMessages ?? [];
+      const messages: Array<Record<string, unknown>> = [
+        { type: "user_message", message: "do the thing" },
+      ];
+      // Surface progressive messages one-by-one across polls.
+      const visibleProgressCount = Math.min(behavior.polls, progressive.length);
+      for (let i = 0; i < visibleProgressCount; i++) {
+        messages.push({ type: "devin_message", message: progressive[i] });
+      }
+      if (isLast) {
+        messages.push({ type: "devin_message", message: behavior.finalMessage });
+      }
       return jsonResponse(200, {
         session_id: behavior.sessionId,
         status_enum: isLast ? "finished" : "working",
         status: isLast ? "finished" : "working",
         url: `https://app.devin.ai/sessions/${behavior.sessionId}`,
-        messages: isLast
-          ? [
-              { type: "user_message", message: "do the thing" },
-              { type: "devin_message", message: behavior.finalMessage },
-            ]
-          : [{ type: "user_message", message: "do the thing" }],
+        messages,
         structured_output: null,
       });
     }
 
     return jsonResponse(404, { error: "not_found", url, method });
   }) as unknown as typeof fetch;
+}
+
+/**
+ * Parse a raw SSE response body into an ordered list of `data:` payloads.
+ * The `[DONE]` sentinel and JSON payloads are returned as-is so callers can
+ * choose to JSON.parse() the rest.
+ */
+function parseSseEvents(raw: string): string[] {
+  const out: string[] = [];
+  for (const block of raw.split(/\r?\n\r?\n/)) {
+    const dataLines = block
+      .split(/\r?\n/)
+      .filter((l) => l.startsWith("data:"))
+      .map((l) => l.slice(5).trimStart());
+    if (dataLines.length === 0) continue;
+    out.push(dataLines.join("\n"));
+  }
+  return out;
 }
 
 function jsonResponse(status: number, body: unknown): Response {
@@ -176,24 +210,130 @@ describe("POST /v1/chat/completions", () => {
     expect(res.body.error?.code).toBe("invalid_messages");
   });
 
-  it("returns 400 when stream=true is requested", async () => {
+  it("streams an SSE response with chat.completion.chunk events when stream=true", async () => {
+    const behavior: MockBehavior = {
+      polls: 0,
+      calls: [],
+      finishAfter: 3,
+      sessionId: "stream-session-1",
+      finalMessage: "All done streaming.",
+    };
+
     const app = createApp({
       config: baseConfig(),
-      fetchImpl: makeFetchMock({
-        polls: 0,
-        calls: [],
-        finishAfter: 1,
-        sessionId: "x",
-        finalMessage: "x",
+      fetchImpl: makeFetchMock(behavior, {
+        // Provide progressive agent messages on each poll so we can verify
+        // incremental SSE chunks are emitted.
+        progressiveMessages: [
+          "Reading the repository...",
+          "Running the test suite...",
+        ],
       }),
       logger: silentLogger,
     });
 
     const res = await request(app)
       .post("/v1/chat/completions")
-      .send({ stream: true, messages: [{ role: "user", content: "hi" }] });
-    expect(res.status).toBe(400);
-    expect(res.body.error?.code).toBe("stream_not_supported");
+      .set("content-type", "application/json")
+      .buffer(true)
+      .send({
+        model: "devin",
+        stream: true,
+        messages: [{ role: "user", content: "Run the test suite." }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/^text\/event-stream/);
+    expect(res.text).toContain("data: [DONE]");
+
+    const events = parseSseEvents(res.text);
+    // Last event must be the [DONE] sentinel.
+    expect(events[events.length - 1]).toBe("[DONE]");
+
+    const chunks: any[] = events.slice(0, -1).map((line: string) => JSON.parse(line));
+    expect(chunks.length).toBeGreaterThanOrEqual(3);
+
+    for (const c of chunks) {
+      expect(c.object).toBe("chat.completion.chunk");
+      expect(c.id).toMatch(/^chatcmpl-/);
+      expect(c.model).toBe("devin");
+      expect(typeof c.created).toBe("number");
+      expect(Array.isArray(c.choices)).toBe(true);
+      expect(c.choices[0]?.index).toBe(0);
+    }
+
+    // First chunk announces the assistant role.
+    expect(chunks[0].choices[0].delta).toEqual({ role: "assistant" });
+    expect(chunks[0].choices[0].finish_reason).toBeNull();
+
+    // Some middle chunk(s) carry incremental content.
+    const contentParts = chunks
+      .map((c: any) => c.choices[0].delta.content)
+      .filter((s: unknown): s is string => typeof s === "string");
+    const combined = contentParts.join("");
+    expect(combined).toContain("Reading the repository...");
+    expect(combined).toContain("Running the test suite...");
+    expect(combined).toContain("All done streaming.");
+
+    // Final chunk closes with finish_reason="stop" and an empty delta.
+    const last = chunks[chunks.length - 1];
+    expect(last.choices[0].finish_reason).toBe("stop");
+    expect(last.choices[0].delta).toEqual({});
+    expect(last.x_devin_session_id).toBe("stream-session-1");
+  });
+
+  it("emits SSE heartbeat comments on polls that produce no new agent messages", async () => {
+    // 4 polls before terminal, no progressive messages -> 3 quiet polls + 1
+    // terminal poll that finally surfaces the final message.
+    const behavior: MockBehavior = {
+      polls: 0,
+      calls: [],
+      finishAfter: 4,
+      sessionId: "stream-heartbeat-1",
+      finalMessage: "Finished after a long quiet stretch.",
+    };
+
+    const app = createApp({
+      config: baseConfig(),
+      fetchImpl: makeFetchMock(behavior, { progressiveMessages: [] }),
+      logger: silentLogger,
+    });
+
+    const res = await request(app)
+      .post("/v1/chat/completions")
+      .set("content-type", "application/json")
+      .buffer(true)
+      .send({
+        model: "devin",
+        stream: true,
+        messages: [{ role: "user", content: "Take your time." }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/^text\/event-stream/);
+
+    // Heartbeat comments are SSE `: ping` lines, ignored by parseSseEvents().
+    const heartbeats = res.text
+      .split(/\r?\n\r?\n/)
+      .filter((block: string) => /^:\s*ping\b/m.test(block));
+    expect(heartbeats.length).toBeGreaterThanOrEqual(3);
+
+    // The stream still terminates correctly and surfaces the final message.
+    const events = parseSseEvents(res.text);
+    expect(events[events.length - 1]).toBe("[DONE]");
+    const chunks: any[] = events.slice(0, -1).map((line: string) => JSON.parse(line));
+    const combined = chunks
+      .map((c: any) => c.choices[0].delta.content)
+      .filter((s: unknown): s is string => typeof s === "string")
+      .join("");
+    expect(combined).toContain("Finished after a long quiet stretch.");
+    expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe("stop");
+
+    // Heartbeats must precede the [DONE] terminator.
+    const lastHeartbeatIdx = res.text.lastIndexOf(": ping");
+    const doneIdx = res.text.indexOf("data: [DONE]");
+    expect(lastHeartbeatIdx).toBeGreaterThan(-1);
+    expect(doneIdx).toBeGreaterThan(lastHeartbeatIdx);
   });
 
   it("returns 400 invalid_request_error when the request body is malformed JSON", async () => {

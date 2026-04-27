@@ -31,7 +31,7 @@ export function isTerminalStatus(status: string | undefined | null): boolean {
   return TERMINAL_DEVIN_STATUSES.has(status.toLowerCase());
 }
 
-function isAgentMessage(msg: DevinSessionMessage): boolean {
+export function isAgentMessage(msg: DevinSessionMessage): boolean {
   // Devin v1 returns messages with a `type`/`origin` we look at heuristically.
   // `devin_message` and `agent_message` are the most common; fall back to any
   // message that is not clearly user-authored.
@@ -44,7 +44,7 @@ function isAgentMessage(msg: DevinSessionMessage): boolean {
   return type !== "" || origin !== "";
 }
 
-function pickMessageText(msg: DevinSessionMessage): string {
+export function pickMessageText(msg: DevinSessionMessage): string {
   if (typeof msg.message === "string" && msg.message.trim()) return msg.message.trim();
   if (typeof msg.content === "string" && msg.content.trim()) return msg.content.trim();
   if (typeof msg.text === "string" && msg.text.trim()) return msg.text.trim();
