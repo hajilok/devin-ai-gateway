@@ -68,8 +68,24 @@ export class SseWriter {
 
   constructor(private readonly res: Response) {}
 
+  /**
+   * The underlying socket may already be torn down (client disconnect, error
+   * mid-flight) before our handler notices. Treat any of those signals as
+   * "closed" so subsequent writes become no-ops instead of throwing
+   * `ERR_STREAM_WRITE_AFTER_END`.
+   */
+  private isResponseDead(): boolean {
+    if (this.closed) return true;
+    const r = this.res as Response & { writableEnded?: boolean; destroyed?: boolean };
+    if (r.writableEnded === true || r.destroyed === true) {
+      this.closed = true;
+      return true;
+    }
+    return false;
+  }
+
   start(): void {
-    if (this.closed) return;
+    if (this.isResponseDead()) return;
     this.res.status(200);
     this.res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     this.res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -81,7 +97,7 @@ export class SseWriter {
   }
 
   writeChunk(chunk: ChatCompletionChunk): void {
-    if (this.closed) return;
+    if (this.isResponseDead()) return;
     const ok = this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     if (ok === false) {
       // Backpressure: the underlying socket buffer is full. We do not block
@@ -92,12 +108,12 @@ export class SseWriter {
   }
 
   writeComment(text: string): void {
-    if (this.closed) return;
+    if (this.isResponseDead()) return;
     this.res.write(`: ${text}\n\n`);
   }
 
   end(): void {
-    if (this.closed) return;
+    if (this.isResponseDead()) return;
     this.res.write("data: [DONE]\n\n");
     this.res.end();
     this.closed = true;
@@ -115,6 +131,6 @@ export class SseWriter {
   }
 
   isClosed(): boolean {
-    return this.closed;
+    return this.isResponseDead();
   }
 }

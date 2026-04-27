@@ -241,8 +241,13 @@ print()
 
 ### Behaviour notes
 
+- **Heartbeats** — on every poll tick that does not produce a new agent
+  message, the gateway emits an SSE comment line (`: ping\n\n`). Comments are
+  ignored by OpenAI-compatible clients but keep the connection alive across
+  proxies / load balancers that close idle TCP streams.
 - **Client disconnect** — closing the HTTP connection mid-stream cancels the
-  internal polling loop; no further Devin requests are made.
+  internal polling loop and the SSE writer is closed immediately, so no
+  in-flight `getSession()` callback can write to a destroyed socket.
 - **Mid-stream errors** — if Devin returns an error after streaming has
   started, the gateway emits one final `delta.content` chunk with a `[gateway
   error: ...]` marker, a `finish_reason: "stop"` chunk, and `[DONE]`, so the

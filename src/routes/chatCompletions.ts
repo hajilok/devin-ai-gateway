@@ -183,6 +183,10 @@ async function handleStreaming(args: StreamingArgs): Promise<void> {
   const onClose = () => {
     clientDisconnected = true;
     abort.abort();
+    // Mark the writer as closed *immediately* so any in-flight `getSession`
+    // callback that finishes after the disconnect cannot write to a destroyed
+    // socket (avoids `ERR_STREAM_WRITE_AFTER_END`).
+    writer.abort();
   };
   req.on("close", onClose);
 
@@ -191,11 +195,17 @@ async function handleStreaming(args: StreamingArgs): Promise<void> {
   const streamedIndices = new Set<number>();
   let streamedAnyContent = false;
 
-  const emitNewMessages = (session: DevinSession): void => {
-    if (writer.isClosed()) return;
+  /**
+   * Emit chunks for any agent message we haven't streamed yet. Returns the
+   * number of chunks written so the caller can decide whether a heartbeat is
+   * needed for this poll.
+   */
+  const emitNewMessages = (session: DevinSession): number => {
+    if (writer.isClosed()) return 0;
     const messages: DevinSessionMessage[] = Array.isArray(session.messages)
       ? session.messages
       : [];
+    let written = 0;
     for (let i = 0; i < messages.length; i++) {
       if (streamedIndices.has(i)) continue;
       streamedIndices.add(i);
@@ -210,7 +220,9 @@ async function handleStreaming(args: StreamingArgs): Promise<void> {
         buildChunk({ id, created: created_ts, model, delta: { content } })
       );
       streamedAnyContent = true;
+      written += 1;
     }
+    return written;
   };
 
   try {
@@ -219,7 +231,14 @@ async function handleStreaming(args: StreamingArgs): Promise<void> {
       timeoutMs: config.devinPollTimeoutMs,
       signal: abort.signal,
       onSnapshot: async (snapshot) => {
-        emitNewMessages(snapshot);
+        const written = emitNewMessages(snapshot);
+        if (written === 0) {
+          // No new content this tick. Send an SSE comment so any HTTP proxy /
+          // load balancer in front of us sees traffic and does not close the
+          // idle connection. Comments are ignored by OpenAI-compatible
+          // clients but keep the socket alive.
+          writer.writeComment("ping");
+        }
       },
     });
 

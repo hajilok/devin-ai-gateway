@@ -282,6 +282,60 @@ describe("POST /v1/chat/completions", () => {
     expect(last.x_devin_session_id).toBe("stream-session-1");
   });
 
+  it("emits SSE heartbeat comments on polls that produce no new agent messages", async () => {
+    // 4 polls before terminal, no progressive messages -> 3 quiet polls + 1
+    // terminal poll that finally surfaces the final message.
+    const behavior: MockBehavior = {
+      polls: 0,
+      calls: [],
+      finishAfter: 4,
+      sessionId: "stream-heartbeat-1",
+      finalMessage: "Finished after a long quiet stretch.",
+    };
+
+    const app = createApp({
+      config: baseConfig(),
+      fetchImpl: makeFetchMock(behavior, { progressiveMessages: [] }),
+      logger: silentLogger,
+    });
+
+    const res = await request(app)
+      .post("/v1/chat/completions")
+      .set("content-type", "application/json")
+      .buffer(true)
+      .send({
+        model: "devin",
+        stream: true,
+        messages: [{ role: "user", content: "Take your time." }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/^text\/event-stream/);
+
+    // Heartbeat comments are SSE `: ping` lines, ignored by parseSseEvents().
+    const heartbeats = res.text
+      .split(/\r?\n\r?\n/)
+      .filter((block: string) => /^:\s*ping\b/m.test(block));
+    expect(heartbeats.length).toBeGreaterThanOrEqual(3);
+
+    // The stream still terminates correctly and surfaces the final message.
+    const events = parseSseEvents(res.text);
+    expect(events[events.length - 1]).toBe("[DONE]");
+    const chunks: any[] = events.slice(0, -1).map((line: string) => JSON.parse(line));
+    const combined = chunks
+      .map((c: any) => c.choices[0].delta.content)
+      .filter((s: unknown): s is string => typeof s === "string")
+      .join("");
+    expect(combined).toContain("Finished after a long quiet stretch.");
+    expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe("stop");
+
+    // Heartbeats must precede the [DONE] terminator.
+    const lastHeartbeatIdx = res.text.lastIndexOf(": ping");
+    const doneIdx = res.text.indexOf("data: [DONE]");
+    expect(lastHeartbeatIdx).toBeGreaterThan(-1);
+    expect(doneIdx).toBeGreaterThan(lastHeartbeatIdx);
+  });
+
   it("returns 400 invalid_request_error when the request body is malformed JSON", async () => {
     const behavior: MockBehavior = {
       polls: 0,
