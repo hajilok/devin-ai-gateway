@@ -137,6 +137,120 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
+## Streaming (`stream: true`)
+
+The gateway accepts `stream: true` and replies with **Server-Sent Events** in
+the exact same shape OpenAI uses for streaming Chat Completions.
+
+- `Content-Type: text/event-stream; charset=utf-8`
+- Each event is a single `data: <json>` line where `<json>` matches
+  `chat.completion.chunk`:
+  ```json
+  {
+    "id": "chatcmpl-...",
+    "object": "chat.completion.chunk",
+    "created": 1714200000,
+    "model": "devin",
+    "choices": [
+      { "index": 0, "delta": { "content": "..." }, "finish_reason": null }
+    ]
+  }
+  ```
+- The first chunk announces the role: `delta: { "role": "assistant" }`.
+- Subsequent chunks carry incremental `delta.content` as Devin emits new agent
+  messages (one chunk per new `devin_message`).
+- The final chunk has an empty `delta: {}` plus a real `finish_reason`
+  (`"stop"` or `"length"` on timeout).
+- The stream is terminated by the OpenAI sentinel `data: [DONE]`.
+
+> Streaming is approximated, not token-by-token: Devin's REST API does not
+> currently expose token-level events, so each chunk corresponds to a new
+> agent message that arrived during a polling tick. This is enough for chat
+> UIs to render progressive output and matches what most OpenAI-compatible
+> clients expect.
+
+### `curl -N` example
+
+```bash
+curl -N http://localhost:8787/v1/chat/completions \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "devin",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "Open the repo and add a CHANGELOG entry for v0.2.0."}
+    ]
+  }'
+```
+
+Expected output (truncated):
+
+```
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"Reading the repository..."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"\nDone. PR opened: ..."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+### OpenAI SDK example (Node.js)
+
+```ts
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8787/v1",
+  apiKey: "secret-token",
+});
+
+const stream = await client.chat.completions.create({
+  model: "devin",
+  stream: true,
+  messages: [{ role: "user", content: "Run the tests and summarize the output." }],
+});
+
+for await (const chunk of stream) {
+  const piece = chunk.choices[0]?.delta?.content;
+  if (piece) process.stdout.write(piece);
+}
+process.stdout.write("\n");
+```
+
+### OpenAI SDK example (Python)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8787/v1", api_key="secret-token")
+stream = client.chat.completions.create(
+    model="devin",
+    stream=True,
+    messages=[{"role": "user", "content": "Run the tests and summarize the output."}],
+)
+for chunk in stream:
+    piece = chunk.choices[0].delta.content
+    if piece:
+        print(piece, end="", flush=True)
+print()
+```
+
+### Behaviour notes
+
+- **Client disconnect** — closing the HTTP connection mid-stream cancels the
+  internal polling loop; no further Devin requests are made.
+- **Mid-stream errors** — if Devin returns an error after streaming has
+  started, the gateway emits one final `delta.content` chunk with a `[gateway
+  error: ...]` marker, a `finish_reason: "stop"` chunk, and `[DONE]`, so the
+  client never hangs.
+- **Initial errors** — if session creation itself fails (auth, bad input,
+  upstream 5xx), the gateway returns a regular OpenAI-style JSON error
+  (`Content-Type: application/json`, no SSE prelude).
+
 ## Configuration
 
 All config is read from environment variables (see `.env.example`).
@@ -160,15 +274,16 @@ All config is read from environment variables (see `.env.example`).
 | --- | --- | --- |
 | `GET` | `/healthz` | Liveness check, no auth. |
 | `GET` | `/v1/models` | Static list (`devin`) for client discovery. |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible entrypoint. Blocks until the Devin session is finished, blocked, expired, or the configured timeout elapses. |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible entrypoint. Supports both blocking JSON responses and `stream: true` SSE (see [Streaming](#streaming-stream-true)). |
 
 ### Limitations
 
-- **No streaming.** `stream: true` is rejected with `400`. (Roadmap.)
 - The `model` field is currently free-form and only used for echoing back into
   the response. Mapping it onto Devin playbooks/snapshots is on the roadmap.
 - `temperature`, `top_p`, `max_tokens`, `n`, etc. are accepted but **ignored**.
 - `usage.*` is always `0`.
+- Streaming is **chunk-per-message**, not true token streaming. Granularity is
+  bounded by `DEVIN_POLL_INTERVAL_MS`.
 
 ## Run with Docker
 
@@ -210,7 +325,8 @@ src/
     types.ts
   openai/
     messagesToPrompt.ts    # OpenAI messages[] -> prompt string
-    formatResponse.ts      # session -> OpenAI Chat Completion
+    formatResponse.ts      # session -> OpenAI Chat Completion (non-stream)
+    streamResponse.ts      # SSE writer + chat.completion.chunk builder
   utils/
     errors.ts              # OpenAI-shaped error envelope
     ids.ts                 # chatcmpl-... id generator
@@ -222,7 +338,7 @@ test/
 
 ## Roadmap
 
-- Streaming (`text/event-stream` SSE) compatible with the OpenAI streaming format.
+- Token-level streaming once Devin exposes streaming events.
 - Model mapping (e.g. `model: "devin/refactor-playbook"` -> Devin `playbook_id`).
 - Auth proxy (multi-tenant API key issuance, scoping to specific Devin keys).
 - Async job mode (`fire-and-forget` returning a session URL right away).
